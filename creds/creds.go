@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 
@@ -53,11 +54,27 @@ func (credWrapper *CredentialHelperWrapper) FillCreds() error {
 // as input.
 type Creds map[string][]string
 
-func bufferCreds(c Creds) *bytes.Buffer {
+func (c Creds) IsMultistage() bool {
+	return slices.Contains([]string{"1", "true"}, FirstEntryForKey(c, "continue"))
+}
+
+func (c Creds) buffer(protectProtocol bool) (*bytes.Buffer, error) {
 	buf := new(bytes.Buffer)
 
+	buf.Write([]byte("capability[]=authtype\n"))
+	buf.Write([]byte("capability[]=state\n"))
 	for k, v := range c {
 		for _, item := range v {
+			if strings.Contains(item, "\n") {
+				return nil, errors.Errorf(tr.Tr.Get("credential value for %s contains newline: %q", k, item))
+			}
+			if protectProtocol && strings.Contains(item, "\r") {
+				return nil, errors.Errorf(tr.Tr.Get("credential value for %s contains carriage return: %q\nIf this is intended, set `credential.protectProtocol=false`", k, item))
+			}
+			if strings.Contains(item, string(rune(0))) {
+				return nil, errors.Errorf(tr.Tr.Get("credential value for %s contains null byte: %q", k, item))
+			}
+
 			buf.Write([]byte(k))
 			buf.Write([]byte("="))
 			buf.Write([]byte(item))
@@ -65,7 +82,7 @@ func bufferCreds(c Creds) *bytes.Buffer {
 		}
 	}
 
-	return buf
+	return buf, nil
 }
 
 type CredentialHelperContext struct {
@@ -76,6 +93,7 @@ type CredentialHelperContext struct {
 
 	urlConfig      *config.URLConfig
 	wwwAuthHeaders []string
+	state          []string
 }
 
 func NewCredentialHelperContext(gitEnv config.Environment, osEnv config.Environment) *CredentialHelperContext {
@@ -118,6 +136,10 @@ func (ctxt *CredentialHelperContext) SetWWWAuthHeaders(headers []string) {
 	ctxt.wwwAuthHeaders = headers
 }
 
+func (ctxt *CredentialHelperContext) SetStateFields(fields []string) {
+	ctxt.state = fields
+}
+
 // getCredentialHelper parses a 'credsConfig' from the git and OS environments,
 // returning the appropriate CredentialHelper to authenticate requests with.
 //
@@ -134,6 +156,9 @@ func (ctxt *CredentialHelperContext) GetCredentialHelper(helper CredentialHelper
 	}
 	if len(ctxt.wwwAuthHeaders) != 0 && !ctxt.urlConfig.Bool("credential", rawurl, "skipwwwauth", false) {
 		input["wwwauth[]"] = ctxt.wwwAuthHeaders
+	}
+	if len(ctxt.state) != 0 {
+		input["state[]"] = ctxt.state
 	}
 
 	if helper != nil {
@@ -153,6 +178,9 @@ func (ctxt *CredentialHelperContext) GetCredentialHelper(helper CredentialHelper
 			helpers = append(helpers, ctxt.askpassCredHelper)
 		}
 	}
+
+	ctxt.commandCredHelper.protectProtocol = ctxt.urlConfig.Bool("credential", rawurl, "protectProtocol", true)
+
 	return CredentialHelperWrapper{CredentialHelper: NewCredentialHelpers(append(helpers, ctxt.commandCredHelper)), Input: input, Url: u}
 }
 
@@ -292,7 +320,8 @@ func (a *AskPassCredentialHelper) args(prompt string) []string {
 }
 
 type commandCredentialHelper struct {
-	SkipPrompt bool
+	SkipPrompt      bool
+	protectProtocol bool
 }
 
 func (h *commandCredentialHelper) Fill(creds Creds) (Creds, error) {
@@ -323,7 +352,10 @@ func (h *commandCredentialHelper) exec(subcommand string, input Creds) (Creds, e
 	if err != nil {
 		return nil, errors.New(tr.Tr.Get("failed to find `git credential %s`: %v", subcommand, err))
 	}
-	cmd.Stdin = bufferCreds(input)
+	cmd.Stdin, err = input.buffer(h.protectProtocol)
+	if err != nil {
+		return nil, errors.New(tr.Tr.Get("invalid input to `git credential %s`: %v", subcommand, err))
+	}
 	cmd.Stdout = output
 	/*
 	   There is a reason we don't read from stderr here:

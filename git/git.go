@@ -212,6 +212,10 @@ func gitNoLFSBuffered(args ...string) (*subprocess.BufferedCmd, error) {
 	return subprocess.BufferedExec("git", gitConfigNoLFS(args...)...)
 }
 
+func gitNoLFSBufferedStdout(args ...string) (*subprocess.BufferedCmd, error) {
+	return subprocess.StdoutBufferedExec("git", gitConfigNoLFS(args...)...)
+}
+
 // Invoke Git with enabled LFS filters
 func git(args ...string) (*subprocess.Cmd, error) {
 	return subprocess.ExecCommand("git", args...)
@@ -223,6 +227,10 @@ func gitSimple(args ...string) (string, error) {
 
 func gitBuffered(args ...string) (*subprocess.BufferedCmd, error) {
 	return subprocess.BufferedExec("git", args...)
+}
+
+func gitBufferedStdout(args ...string) (*subprocess.BufferedCmd, error) {
+	return subprocess.StdoutBufferedExec("git", args...)
 }
 
 func CatFile() (*subprocess.BufferedCmd, error) {
@@ -247,7 +255,7 @@ func DiffIndex(ref string, cached bool, refresh bool, workingDir string) (*bufio
 		args = append([]string{"-C", workingDir}, args...)
 	}
 
-	cmd, err := gitBuffered(args...)
+	cmd, err := gitBufferedStdout(args...)
 	if err != nil {
 		return nil, err
 	}
@@ -256,6 +264,23 @@ func DiffIndex(ref string, cached bool, refresh bool, workingDir string) (*bufio
 	}
 
 	return bufio.NewScanner(cmd.Stdout), nil
+}
+
+func DiffIndexWithPaths(ref string, cached bool, paths []string) (string, error) {
+	args := []string{"diff-index"}
+	if cached {
+		args = append(args, "--cached")
+	}
+	args = append(args, ref)
+	args = append(args, "--")
+	args = append(args, paths...)
+
+	output, err := gitSimple(args...)
+	if err != nil {
+		return "", err
+	}
+
+	return output, nil
 }
 
 func HashObject(r io.Reader) (string, error) {
@@ -296,6 +321,20 @@ func LsTree(ref string) (*subprocess.BufferedCmd, error) {
 		"-z",          // null line termination
 		"--full-tree", // start at the root regardless of where we are in it
 		ref,
+	)
+}
+
+func LsFilesLFS() (*subprocess.BufferedCmd, error) {
+	// This requires Git 2.42.0 for `--format` with `objecttype`.
+	return gitNoLFSBuffered(
+		"ls-files",
+		"--cached",
+		"--exclude-standard",
+		"--full-name",
+		"--sparse",
+		"-z",
+		"--format=%(objectmode) %(objecttype) %(objectname) %(objectsize)\t%(path)",
+		":(top,attr:filter=lfs)",
 	)
 }
 
@@ -865,17 +904,114 @@ func GitCommonDir() (string, error) {
 	return tools.CanonicalizePath(path, false)
 }
 
-// A git worktree (ref + path)
+// A git worktree (ref + path + flags)
 type Worktree struct {
-	Ref Ref
-	Dir string
+	Ref      Ref
+	Dir      string
+	Prunable bool
 }
 
-// GetAllWorkTrees returns the refs that all worktrees are using as HEADs plus the worktree's path.
-// This returns all worktrees plus the master working copy, and works even if
+// GetAllWorktrees returns the refs that all worktrees are using as HEADs plus the worktree's path.
+// This returns all worktrees plus the main working copy, and works even if
 // working dir is actually in a worktree right now
-// Pass in the git storage dir (parent of 'objects') to work from
-func GetAllWorkTrees(storageDir string) ([]*Worktree, error) {
+//
+// Pass in the git storage dir (parent of 'objects') to work from, in case
+// we need to fall back to reading the worktree files directly.
+func GetAllWorktrees(storageDir string) ([]*Worktree, error) {
+	// Versions before 2.7.0 don't support "git-worktree list", and
+	// those before 2.36.0 don't support the "-z" option, so in these
+	// cases we fall back to reading the .git/worktrees directory entries
+	// and then reading the current worktree's HEAD ref.  This requires
+	// the contents of .git/worktrees/*/gitdir files to be absolute paths,
+	// which is only true for Git versions prior to 2.48.0.
+	if !IsGitVersionAtLeast("2.36.0") {
+		return getAllWorktreesFromGitDir(storageDir)
+	}
+
+	cmd, err := gitNoLFS(
+		"worktree",
+		"list",
+		"--porcelain",
+		"-z", // handle special chars in filenames
+	)
+	if err != nil {
+		return nil, errors.New(tr.Tr.Get("failed to find `git worktree`: %v", err))
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, errors.New(tr.Tr.Get("failed to open output pipe to `git worktree`: %v", err))
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, errors.New(tr.Tr.Get("failed to open error pipe to `git worktree`: %v", err))
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, errors.New(tr.Tr.Get("failed to start `git worktree`: %v", err))
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Split(tools.SplitOnNul)
+	var dir string
+	var ref *Ref
+	var prunable bool
+	var worktrees []*Worktree
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if len(line) == 0 {
+			if len(dir) > 0 && ref != nil && len(ref.Sha) > 0 {
+				worktrees = append(worktrees, &Worktree{
+					Ref:      *ref,
+					Dir:      dir,
+					Prunable: prunable,
+				})
+			}
+			dir = ""
+			ref = nil
+			continue
+		}
+
+		parts := strings.SplitN(scanner.Text(), " ", 2)
+
+		// We ignore other attributes such as "locked" for now.
+		switch parts[0] {
+		case "worktree":
+			if len(parts) == 2 && len(dir) == 0 {
+				dir = filepath.Clean(parts[1])
+				ref = &Ref{Type: RefTypeOther}
+				prunable = false
+			}
+		case "HEAD":
+			if len(parts) == 2 && ref != nil {
+				ref.Sha = parts[1]
+				ref.Name = parts[1]
+			}
+		case "branch":
+			if len(parts) == 2 && ref != nil && len(ref.Sha) > 0 {
+				ref = ParseRef(parts[1], ref.Sha)
+			}
+		case "bare":
+			// We ignore bare worktrees.
+			dir = ""
+			ref = nil
+		case "prunable":
+			prunable = true
+		}
+	}
+
+	// We assume any error output will be short and won't block
+	// command completion if it isn't drained by a separate goroutine.
+	msg, _ := io.ReadAll(stderr)
+	if err := cmd.Wait(); err != nil {
+		return nil, errors.New(tr.Tr.Get("error in `git worktree`: %v: %s", err, msg))
+	}
+
+	return worktrees, nil
+}
+
+func getAllWorktreesFromGitDir(storageDir string) ([]*Worktree, error) {
 	worktreesdir := filepath.Join(storageDir, "worktrees")
 	dirf, err := os.Open(worktreesdir)
 	if err != nil && !os.IsNotExist(err) {
@@ -910,7 +1046,22 @@ func GetAllWorkTrees(storageDir string) ([]*Worktree, error) {
 					continue
 				}
 
-				worktrees = append(worktrees, &Worktree{*ref, filepath.Dir(dir)})
+				// Check if the worktree exists.
+				dir = filepath.Dir(dir)
+				var prunable bool
+				if _, err := os.Stat(dir); err != nil {
+					if os.IsNotExist(err) {
+						prunable = true
+					} else {
+						tracerx.Printf("Error checking worktree directory %s: %v", dir, err)
+					}
+				}
+
+				worktrees = append(worktrees, &Worktree{
+					Ref:      *ref,
+					Dir:      dir,
+					Prunable: prunable,
+				})
 			}
 		}
 	}
@@ -924,7 +1075,11 @@ func GetAllWorkTrees(storageDir string) ([]*Worktree, error) {
 	if err == nil {
 		dir, err := RootDir()
 		if err == nil {
-			worktrees = append(worktrees, &Worktree{*ref, dir})
+			worktrees = append(worktrees, &Worktree{
+				Ref:      *ref,
+				Dir:      dir,
+				Prunable: false,
+			})
 		} else { // ok if not exists, probably bare repo
 			tracerx.Printf("Error getting toplevel for main checkout, skipping: %v", err)
 		}
@@ -1240,11 +1395,17 @@ func Fetch(remotes ...string) error {
 	return err
 }
 
-// RemoteRefs returns a list of branches & tags for a remote by actually
-// accessing the remote via git ls-remote.
-func RemoteRefs(remoteName string) ([]*Ref, error) {
+// RemoteRefs returns a list of branches and, optionally, tags for a remote
+// by actually accessing the remote via git ls-remote.
+func RemoteRefs(remoteName string, withTags bool) ([]*Ref, error) {
 	var ret []*Ref
-	cmd, err := gitNoLFS("ls-remote", "--heads", "--tags", "-q", remoteName)
+	args := []string{"ls-remote", "--heads", "-q"}
+	if withTags {
+		args = append(args, "--tags")
+	}
+	args = append(args, remoteName)
+
+	cmd, err := gitNoLFS(args...)
 	if err != nil {
 		return nil, errors.New(tr.Tr.Get("failed to find `git ls-remote`: %v", err))
 	}
@@ -1265,6 +1426,9 @@ func RemoteRefs(remoteName string) ([]*Ref, error) {
 
 			typ := RefTypeRemoteBranch
 			if ns == "tags" {
+				if !withTags {
+					return nil, errors.New(tr.Tr.Get("unexpected tag returned by `git ls-remote --heads`: %s %s", name, sha))
+				}
 				typ = RefTypeRemoteTag
 			}
 			ret = append(ret, &Ref{name, typ, sha})
