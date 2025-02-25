@@ -63,11 +63,58 @@ begin_test "fetch"
   cd clone
   rm -rf .git/lfs/objects
 
+  git lfs fetch --dry-run 2>&1 | tee fetch.log
+  grep "fetch $contents_oid => a\.dat" fetch.log
+  refute_local_object "$contents_oid"
+
   git lfs fetch
   assert_local_object "$contents_oid" 1
 
   git lfs fsck 2>&1 | tee fsck.log
   grep "Git LFS fsck OK" fsck.log
+
+  git lfs fetch --dry-run 2>&1 | tee fetch.log
+  grep "fetch .* => a\.dat" fetch.log && exit 1 || true
+)
+end_test
+
+begin_test "fetch --json"
+(
+  set -e
+  cd clone
+  rm -rf .git/lfs/objects
+
+  git lfs fetch --dry-run --json | tee fetch-dry-run.json
+  git lfs fetch --json | tee fetch.json
+  assert_local_object "$contents_oid" 1
+  cat > expected.json <<-EOF
+{
+ "transfers": [
+  {
+   "name": "a.dat",
+   "oid": "$contents_oid",
+   "size": 1,
+   "actions": {
+    "download": {
+     "href": "$GITSERVER/storage/$contents_oid?r=$reponame",
+     "expires_at": "0001-01-01T00:00:00Z"
+    }
+   },
+   "path": "$(native_path_escaped "$(local_object_path "$contents_oid")")"
+  }
+ ]
+}
+EOF
+  diff -u expected.json fetch-dry-run.json
+  diff -u expected.json fetch.json
+
+  git lfs fetch --json | tee fetch.json
+  cat > expected.json <<-EOF
+{
+ "transfers": []
+}
+EOF
+  diff -u expected.json fetch.json
 )
 end_test
 
@@ -128,12 +175,85 @@ begin_test "fetch with remote and branches"
 
   rm -rf .git/lfs/objects
 
+  git lfs fetch origin main newbranch --dry-run 2>&1 | tee fetch.log
+  grep "fetch $contents_oid => a\.dat" fetch.log
+  grep "fetch $b_oid => b\.dat" fetch.log
+  refute_local_object "$contents_oid"
+  refute_local_object "$b_oid"
+
   git lfs fetch origin main newbranch
   assert_local_object "$contents_oid" 1
   assert_local_object "$b_oid" 1
 
   git lfs fsck 2>&1 | tee fsck.log
   grep "Git LFS fsck OK" fsck.log
+
+  git lfs fetch origin main newbranch --dry-run | tee fetch.log
+  grep "fetch .* => [ab]\.dat" fetch.log && exit 1 || true
+)
+end_test
+
+begin_test "fetch --json with remote and branches"
+(
+  set -e
+  cd clone
+
+  git checkout newbranch
+  git checkout main
+
+  rm -rf .git/lfs/objects
+
+  git lfs fetch origin main newbranch --json --dry-run | tee fetch-dry-run.json
+  refute_local_object "$contents_oid"
+  refute_local_object "$b_oid"
+
+  git lfs fetch origin main newbranch --json | tee fetch.json
+  assert_local_object "$contents_oid" 1
+  assert_local_object "$b_oid" 1
+
+  # Check the JSON output, without enforcing order between a.dat and b.dat
+  expected_a='{
+   "name": "a.dat",
+   "oid": "'$contents_oid'",
+   "size": 1,
+   "actions": {
+    "download": {
+     "href": "'$GITSERVER'/storage/'$contents_oid'?r='$reponame'",
+     "expires_at": "0001-01-01T00:00:00Z"
+    }
+   },
+   "path": "'$(native_path_escaped "$(local_object_path "$contents_oid")")'"
+  }'
+  expected_b='{
+   "name": "b.dat",
+   "oid": "'$b_oid'",
+   "size": 1,
+   "actions": {
+    "download": {
+     "href": "'$GITSERVER'/storage/'$b_oid'?r='$reponame'",
+     "expires_at": "0001-01-01T00:00:00Z"
+    }
+   },
+   "path": "'$(native_path_escaped "$(local_object_path "$b_oid")")'"
+  }'
+  cat > expected-a-b.json <<-EOF
+{
+ "transfers": [
+  $expected_a,
+  $expected_b
+ ]
+}
+EOF
+  cat > expected-b-a.json <<-EOF
+{
+ "transfers": [
+  $expected_b,
+  $expected_a
+ ]
+}
+EOF
+  diff -u expected-a-b.json fetch-dry-run.json || diff -u expected-b-a.json fetch-dry-run.json || exit 1
+  diff -u expected-a-b.json fetch.json || diff -u expected-b-a.json fetch-dry-run.json || exit 1
 )
 end_test
 
