@@ -293,7 +293,7 @@ begin_test "migrate info (above threshold, top)"
 
   setup_multiple_local_branches
 
-  base64 < /dev/urandom | head -c 160 > b.bin
+  lfstest-genrandom --base64 160 >b.bin
   git add b.bin
   git commit -m "b.bin"
 
@@ -316,7 +316,7 @@ begin_test "migrate info (top)"
 
   setup_multiple_local_branches
 
-  base64 < /dev/urandom | head -c 160 > b.bin
+  lfstest-genrandom --base64 160 >b.bin
   git add b.bin
   git commit -m "b.bin"
 
@@ -455,7 +455,7 @@ begin_test "migrate info (existing .gitattributes symlink)"
     exit 1
   fi
 
-  grep "migrate: expected '.gitattributes' to be a file, got a symbolic link" migrate.log
+  grep "expected '.gitattributes' to be a file, got a symbolic link" migrate.log
 
   main="$(git rev-parse refs/heads/main)"
 
@@ -480,7 +480,7 @@ begin_test "migrate info (potential fixup, --fixup, .gitattributes symlink)"
     exit 1
   fi
 
-  grep "migrate: expected '.gitattributes' to be a file, got a symbolic link" migrate.log
+  grep "expected '.gitattributes' to be a file, got a symbolic link" migrate.log
 
   main="$(git rev-parse refs/heads/main)"
 
@@ -518,7 +518,7 @@ begin_test "migrate info (no potential fixup, --fixup, .gitattributes with macro
   setup_multiple_local_branches
 
   echo "[attr]foo foo" >.gitattributes
-  base64 < /dev/urandom | head -c 30 > a.md
+  lfstest-genrandom --base64 30 >a.md
   git add .gitattributes a.md
   git commit -m macro
 

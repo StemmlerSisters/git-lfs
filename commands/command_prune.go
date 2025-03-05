@@ -233,7 +233,7 @@ func logVerboseOutput(logger *tasklog.Logger, verboseOutput []string, numPrunabl
 	defer info.Complete()
 
 	if dryRun {
-		info.Logf("prune: %s", tr.Tr.GetN(
+		info.Log(tr.Tr.GetN(
 			"%d file would be pruned (%s)",
 			"%d files would be pruned (%s)",
 			numPrunableObjects,
@@ -307,7 +307,7 @@ func pruneTaskDisplayProgress(progressChan PruneProgressChan, waitg *sync.WaitGr
 		case PruneProgressTypeUnverified:
 			notRemoteCount += p.Count
 		}
-		msg = fmt.Sprintf("prune: %s, %s",
+		msg = fmt.Sprintf("%s, %s",
 			tr.Tr.GetN("%d local object", "%d local objects", localCount, localCount),
 			tr.Tr.GetN("%d retained", "%d retained", retainCount, retainCount))
 		if verifyCount > 0 {
@@ -342,7 +342,7 @@ func pruneTaskCollectErrors(outtaskErrors *[]error, errorChan chan error, errorw
 }
 
 func pruneDeleteFiles(prunableObjects []string, logger *tasklog.Logger) {
-	task := logger.Percentage(fmt.Sprintf("prune: %s", tr.Tr.Get("Deleting objects")), uint64(len(prunableObjects)))
+	task := logger.Percentage(tr.Tr.Get("Deleting objects"), uint64(len(prunableObjects)))
 	defer task.Complete()
 
 	var problems bytes.Buffer
@@ -508,7 +508,7 @@ func pruneTaskGetRetainedWorktree(gitscanner *lfs.GitScanner, fetchconf lfs.Fetc
 
 	// Retain other worktree HEADs too
 	// Working copy, branch & maybe commit is different but repo is shared
-	allWorktrees, err := git.GetAllWorkTrees(cfg.LocalGitStorageDir())
+	allWorktrees, err := git.GetAllWorktrees(cfg.LocalGitStorageDir())
 	if err != nil {
 		errorChan <- err
 		return
@@ -536,9 +536,11 @@ func pruneTaskGetRetainedWorktree(gitscanner *lfs.GitScanner, fetchconf lfs.Fetc
 			go pruneTaskGetRetainedAtRef(gitscanner, worktree.Ref.Sha, retainChan, errorChan, waitg, sem)
 		}
 
-		// Always scan the index of the worktree
-		waitg.Add(1)
-		go pruneTaskGetRetainedIndex(gitscanner, worktree.Ref.Sha, worktree.Dir, retainChan, errorChan, waitg, sem)
+		if !worktree.Prunable {
+			// Always scan the index of the worktree if it exists
+			waitg.Add(1)
+			go pruneTaskGetRetainedIndex(gitscanner, worktree.Ref.Sha, worktree.Dir, retainChan, errorChan, waitg, sem)
+		}
 	}
 }
 
